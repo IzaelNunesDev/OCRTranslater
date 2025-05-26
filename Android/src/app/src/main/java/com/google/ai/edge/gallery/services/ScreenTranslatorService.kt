@@ -38,6 +38,7 @@ import com.google.ai.edge.gallery.R
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
+import com.google.mlkit.vision.text.Text // Added for Text.TextBlock parameter
 // Keep existing android.media.Image import (implicitly available)
 import android.graphics.Bitmap
 import com.google.ai.edge.gallery.data.Model
@@ -449,6 +450,13 @@ class ScreenTranslatorService : Service() {
             Log.d(TAG, "ML Kit failure. isProcessingFrame reset to false.")
         }
     } // End of processImageForTranslation
+
+    private fun стабильныйIdParaBloco(block: Text.TextBlock): String {
+        val box = block.boundingBox
+        val centerX = box?.centerX()?.div(10) ?: 0
+        val centerY = box?.centerY()?.div(10) ?: 0
+        return "${block.text.hashCode()}_${centerX}_${centerY}"
+    }
 
     override fun onDestroy() {
         super.onDestroy()

@@ -22,6 +22,14 @@ import android.os.Looper
 import android.util.DisplayMetrics
 import android.util.Log
 import android.media.Image
+import android.view.Gravity
+import android.view.MotionEvent
+import android.view.View
+// WindowManager is already imported
+// PixelFormat is already imported
+// Intent is already imported
+// R file import will be com.google.ai.edge.gallery.R
+import com.google.android.material.floatingactionbutton.FloatingActionButton // Using FAB
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -55,6 +63,12 @@ import android.os.Handler
 
 class ScreenTranslatorService : Service() {
 
+    // Floating Action Button variables
+    private var windowManager: WindowManager? = null
+    private var floatingButtonView: View? = null
+    private var floatingButtonParams: WindowManager.LayoutParams? = null
+    // private val ACTION_CAPTURE_AND_TRANSLATE = "ACTION_CAPTURE_AND_TRANSLATE" // Will be added in companion object
+
     override fun onBind(intent: Intent?): IBinder? {
         return null // We don't provide binding, so return null
     }
@@ -74,6 +88,8 @@ class ScreenTranslatorService : Service() {
     private var overlayManager: OverlayManager? = null
     private lateinit var imageReaderHandler: Handler
     private val isProcessingFrame = AtomicBoolean(false)
+    private val captureRequested = AtomicBoolean(false)
+    private val translationCache = mutableMapOf<String, String>() // Added translation cache
 
     // Coroutine scope for the service, tied to its lifecycle.
     // Use SupervisorJob so if one child coroutine fails, others are not affected.
@@ -103,7 +119,8 @@ class ScreenTranslatorService : Service() {
         // Add other fields from Model class as needed, e.g., info, learnMoreUrl, configs etc.
         // For now, focusing on core fields for loading and basic operation.
 
-        var isProcessingEnabled = true // Default to true when service starts
+        const val ACTION_CAPTURE_AND_TRANSLATE = "ACTION_CAPTURE_AND_TRANSLATE" // Action for FAB
+        // var isProcessingEnabled = true // Removed: No longer controlling processing this way
     }
 
     override fun onCreate() {
@@ -132,6 +149,10 @@ class ScreenTranslatorService : Service() {
             screenDensity = displayMetrics.densityDpi
         }
         Log.d(TAG, "Screen dimensions: $screenWidth x $screenHeight @ $screenDensity dpi")
+
+        // Initialize WindowManager here as it's definitely needed if we show the button
+        this.windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        showFloatingButton()
     }
 
     private fun prepareGemmaModel() {
@@ -234,6 +255,17 @@ class ScreenTranslatorService : Service() {
         startForeground(ONGOING_NOTIFICATION_ID, notification)
         Log.d(TAG, "startForeground called")
 
+        // Handle specific actions first
+        if (intent?.action == ACTION_CAPTURE_AND_TRANSLATE) {
+            Log.d(TAG, "onStartCommand received ACTION_CAPTURE_AND_TRANSLATE")
+            triggerCaptureAndTranslate()
+            // After handling the action, we still want to ensure MediaProjection is set up if needed,
+            // or that the service continues running as sticky.
+            // So, we don't return immediately here unless this action is mutually exclusive
+            // with MediaProjection setup, which it isn't necessarily.
+        }
+
+        // Existing logic for MediaProjection setup
         if (intent?.hasExtra(EXTRA_RESULT_CODE) == true && intent.hasExtra(EXTRA_DATA_INTENT)) {
             val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, Activity.RESULT_CANCELED)
             val data = intent.getParcelableExtra<Intent>(EXTRA_DATA_INTENT) // Use getParcelableExtra with type for API 33+
@@ -305,49 +337,67 @@ class ScreenTranslatorService : Service() {
     private fun setupImageReaderAndVirtualDisplay() {
         Log.d(TAG, "Setting up ImageReader and VirtualDisplay.")
         imageReader = ImageReader.newInstance(screenWidth, screenHeight, PixelFormat.RGBA_8888, 2)
-        imageReader?.setOnImageAvailableListener({
-            reader ->
+        imageReader?.setOnImageAvailableListener({ reader ->
             if (isProcessingFrame.compareAndSet(false, true)) {
-                var originalImage: Image? = null
+                var image: Image? = null
                 try {
-                    originalImage = reader?.acquireLatestImage()
-                    if (originalImage != null) {
-                        val planes = originalImage.planes
-                        val buffer = planes[0].buffer
-                        val pixelStride = planes[0].pixelStride
-                        val rowStride = planes[0].rowStride
-                        val rowPadding = rowStride - pixelStride * screenWidth
+                    if (captureRequested.compareAndSet(true, false)) {
+                        Log.d(TAG, "Capture requested. Processing image.")
+                        image = reader?.acquireLatestImage()
+                        if (image != null) {
+                            val planes = image.planes
+                            val buffer = planes[0].buffer
+                            val pixelStride = planes[0].pixelStride
+                            val rowStride = planes[0].rowStride
+                            val rowPadding = rowStride - pixelStride * screenWidth
 
-                        val bitmapWidth = screenWidth + rowPadding / pixelStride
-                        val tempBitmap = Bitmap.createBitmap(bitmapWidth, screenHeight, Bitmap.Config.ARGB_8888)
-                        tempBitmap.copyPixelsFromBuffer(buffer)
+                            val bitmapWidth = screenWidth + rowPadding / pixelStride
+                            val tempBitmap = Bitmap.createBitmap(bitmapWidth, screenHeight, Bitmap.Config.ARGB_8888)
+                            tempBitmap.copyPixelsFromBuffer(buffer)
 
-                        val finalBitmapToProcess: Bitmap
-                        if (rowPadding > 0) {
-                            finalBitmapToProcess = Bitmap.createBitmap(tempBitmap, 0, 0, screenWidth, screenHeight)
-                            if (!tempBitmap.isRecycled) {
-                                tempBitmap.recycle() // Recycle the larger, intermediate bitmap
+                            val finalBitmapToProcess: Bitmap
+                            if (rowPadding > 0) {
+                                finalBitmapToProcess = Bitmap.createBitmap(tempBitmap, 0, 0, screenWidth, screenHeight)
+                                if (!tempBitmap.isRecycled) {
+                                    tempBitmap.recycle()
+                                }
+                            } else {
+                                finalBitmapToProcess = tempBitmap
                             }
+                            // processImageForTranslation will handle resetting isProcessingFrame and recycling finalBitmapToProcess
+                            processImageForTranslation(finalBitmapToProcess)
+                            // Note: image (original Image object) must be closed here or by processImageForTranslation.
+                            // Current processImageForTranslation does not take the original Image object.
+                            // So, it must be closed here after processImageForTranslation is called.
+                            // However, processImageForTranslation is async. The 'image' might be closed before processing finishes.
+                            // This is problematic. The original image from ImageReader should ideally be passed through
+                            // and closed only after all its derived data (like bitmap) is fully processed or no longer needed.
+                            // For now, adhering to prompt to call processImageForTranslation(bitmap) and close image afterwards.
+                            // This implies processImageForTranslation must complete synchronously regarding bitmap usage,
+                            // or bitmap must be copied if processImageForTranslation is fully async regarding bitmap.
+                            // Given current structure, processImageForTranslation uses the bitmap immediately for MLKit.
                         } else {
-                            finalBitmapToProcess = tempBitmap // No crop, final is the original
+                            Log.w(TAG, "Capture requested, but acquireLatestImage returned null.")
+                            isProcessingFrame.set(false) // Reset as no processing will happen
                         }
-                        // Pass originalImage to be closed by processImageForTranslation or its callees
-                        processImageForTranslation(finalBitmapToProcess) // Removed originalImage from params here, will be closed in finally
                     } else {
-                        Log.w(TAG, "acquireLatestImage returned null.")
-                        isProcessingFrame.set(false) // Reset if no image acquired
+                        // No capture requested, acquire and close to keep the queue clear.
+                        Log.d(TAG, "No capture requested. Acquiring and closing image.")
+                        image = reader?.acquireLatestImage()
+                        // image?.close() is done in finally block
+                        isProcessingFrame.set(false) // Reset as no processing was done
                     }
                 } catch (e: Exception) {
-                    Log.e(TAG, "Error processing image in onImageAvailable", e)
+                    Log.e(TAG, "Error in onImageAvailable", e)
                     isProcessingFrame.set(false) // Reset on error
                 } finally {
-                    originalImage?.close() // Always close the original image
-                    // isProcessingFrame is reset inside processImageForTranslation or if originalImage is null/error
+                    image?.close() // Close the original image in all cases if acquired
                 }
             } else {
-                // Frame processing is already in progress, acquire and immediately close this new frame.
-                reader?.acquireLatestImage()?.use { /* it.close() is called by use */ }
-                Log.d(TAG, "Dropping frame as another is already being processed.")
+                // isProcessingFrame was already true, meaning a frame is currently being handled.
+                // Acquire and immediately close this new frame to keep the queue clear.
+                reader?.acquireLatestImage()?.use { it.close() } // 'use' will auto-close
+                Log.d(TAG, "ImageReader queue: Dropping frame as another is already being processed.")
             }
         }, imageReaderHandler)
         virtualDisplay = mediaProjection?.createVirtualDisplay("ScreenTranslator", screenWidth, screenHeight, screenDensity, DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, imageReader?.surface, null, null)
@@ -374,61 +424,73 @@ class ScreenTranslatorService : Service() {
             .addOnSuccessListener { visionText ->
                 Log.d(TAG, "ML Kit Text Recognition Success. Full text: ${visionText.text.substring(0, minOf(visionText.text.length, 100))}...")
                 
+                // Clear previous overlays first on the main thread
+                imageReaderHandler.post { overlayManager?.removeAllOverlays() }
+
                 serviceScope.launch(Dispatchers.IO) { // Explicitly move to background
                     try {
-                        imageReaderHandler.post { overlayManager?.removeAllOverlays() } // Keep UI on main
-
                         val modelReady = withTimeoutOrNull(MODEL_INIT_TIMEOUT_MS) {
                             currentSignalForJob.await() // Await the signal of the model captured at the start of this job
                         }
 
-                        // After await, check if the model we intended to use (currentModelForJob) has its instance ready.
                         if (modelReady != true || currentModelForJob.instance == null) {
                             Log.w(TAG, "Gemma model '${currentModelForJob.name}' instance not ready after waiting. Skipping. modelReady: $modelReady, instanceNull: ${currentModelForJob.instance == null}")
-                            // No return@launch here, let finally block handle cleanup
                         } else {
-                            Log.d(TAG, "Gemma model '${currentModelForJob.name}' is ready. Proceeding with translation.")
+                            Log.d(TAG, "Gemma model '${currentModelForJob.name}' is ready. Proceeding with translation for ${visionText.textBlocks.size} blocks.")
                             for (block in visionText.textBlocks) {
-                                Log.d(TAG, "Block text: '${block.text}', BoundingBox: ${block.boundingBox}")
+                                val textToTranslate = block.text
+                                val boundingBox = block.boundingBox ?: continue // Skip if no bounding box
 
-                                if (currentModelForJob.instance == null) {
-                                    Log.e(
-                                        TAG,
-                                        "CRITICAL: Instance of '${currentModelForJob.name}' became null unexpectedly within translation loop for block '${block.text.take(20)}...'. Skipping block."
-                                    )
+                                if (currentModelForJob.instance == null) { // Re-check instance before each inference
+                                    Log.e(TAG, "CRITICAL: Instance of '${currentModelForJob.name}' became null before processing block '${textToTranslate.take(20)}...'. Skipping block.")
                                     continue
                                 }
 
-                                val boundingBox = block.boundingBox
-                                if (boundingBox != null) {
-                            val textToTranslate = block.text
-                            val translatedTextBuilder = StringBuilder()
-                            val imageForLlm: Bitmap? = null // Placeholder for now, LLM image input not used in this flow yet
-
-                            val prompt = "Translate to Portuguese: $textToTranslate"
-
-                            LlmChatModelHelper.runInference(
-                                model = currentModelForJob,
-                                input = prompt,
-                                resultListener = { partialResult, done ->
-                                    translatedTextBuilder.append(partialResult)
-                                    if (done) {
-                                        Log.i(TAG, "Translation for '${block.text}': ${translatedTextBuilder.toString()}")
-                                        imageReaderHandler.post {
-                                            overlayManager?.addOverlay(
-                                                block.boundingBox!!,
-                                                translatedTextBuilder.toString()
-                                            )
-                                        }
+                                val cachedTranslation = translationCache[textToTranslate]
+                                if (cachedTranslation != null) {
+                                    Log.d(TAG, "Cache hit for '${textToTranslate.take(50)}...': '$cachedTranslation'")
+                                    imageReaderHandler.post {
+                                        overlayManager?.addOverlay(boundingBox, cachedTranslation)
                                     }
-                                },
-                                cleanUpListener = {
-                                    Log.d(TAG, "LLM Inference clean up for block: ${block.text}")
-                                },
+                                } else {
+                                    Log.d(TAG, "Cache miss for '${textToTranslate.take(50)}...'. Translating...")
+                                    // Add placeholder "Translating..." overlay
+                                    imageReaderHandler.post {
+                                        overlayManager?.addOverlay(boundingBox, "Translating...")
+                                    }
+
+                                    val prompt = "Translate to Portuguese: $textToTranslate"
+                                    val translatedTextBuilder = StringBuilder()
+                                    
+                                    // LlmChatModelHelper.runInference is asynchronous and uses listeners
+                                    LlmChatModelHelper.runInference(
+                                        model = currentModelForJob,
+                                        input = prompt,
+                                        resultListener = { partialResult, done ->
+                                            translatedTextBuilder.append(partialResult)
+                                            if (done) {
+                                                val fullTranslatedText = translatedTextBuilder.toString().trim()
+                                                Log.i(TAG, "Translation for '${textToTranslate.take(50)}...': '$fullTranslatedText'")
+                                                translationCache[textToTranslate] = fullTranslatedText
+                                                imageReaderHandler.post {
+                                                    // Use updateOverlay as per requirement
+                                                    overlayManager?.updateOverlay(boundingBox, fullTranslatedText)
+                                                }
+                                            }
+                                        },
+                                        cleanUpListener = {
+                                            Log.d(TAG, "LLM Inference clean up for block: ${textToTranslate.take(50)}...")
+                                        }
+                                    )
+                                }
+                            }
                         }
-                    }
-                } finally {
-                    // This finally block is for the serviceScope.launch(Dispatchers.IO)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Error during translation processing in coroutine", e)
+                        // Ensure isProcessingFrame is reset even if an error occurs within the coroutine
+                        // The finally block below will handle this.
+                    } finally {
+                        // This finally block is for the serviceScope.launch(Dispatchers.IO)
                     // Ensure finalBitmapToProcess is recycled and isProcessingFrame is reset
                     // This will run after the translation logic or if an exception occurs within the coroutine
                     if (!finalBitmapToProcess.isRecycled) {
@@ -461,6 +523,7 @@ class ScreenTranslatorService : Service() {
     override fun onDestroy() {
         super.onDestroy()
         Log.d(TAG, "Destroying ScreenTranslatorService.")
+        hideFloatingButton() // Call hideFloatingButton at the beginning
         stopForeground(STOP_FOREGROUND_REMOVE)
         virtualDisplay?.release()
         imageReader?.close()
@@ -504,6 +567,99 @@ class ScreenTranslatorService : Service() {
                 getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
             notificationManager.createNotificationChannel(channel)
             Log.d(TAG, "Notification channel created")
+        }
+    }
+
+    private fun triggerCaptureAndTranslate() {
+        Log.d(TAG, "triggerCaptureAndTranslate() called. Setting captureRequested to true.")
+        captureRequested.set(true)
+        // The onImageAvailable listener will now pick up this request.
+    }
+
+    private fun showFloatingButton() {
+        if (floatingButtonView != null) {
+            Log.d(TAG, "Floating button already shown.")
+            return
+        }
+
+        // Ensure windowManager is initialized (should be by onCreate)
+        if (this.windowManager == null) {
+            this.windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        }
+
+        floatingButtonView = View.inflate(this, R.layout.floating_button, null)
+
+        floatingButtonParams = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            x = 0
+            y = 100 // Initial Y position
+        }
+
+        val captureButton = floatingButtonView?.findViewById<FloatingActionButton>(R.id.capture_button)
+        captureButton?.setOnClickListener {
+            Log.d(TAG, "Floating Action Button clicked. Sending ACTION_CAPTURE_AND_TRANSLATE.")
+            val serviceIntent = Intent(applicationContext, ScreenTranslatorService::class.java).apply {
+                action = ACTION_CAPTURE_AND_TRANSLATE
+                // Note: If the service needs specific data to handle this action (e.g., current media projection data),
+                // it should be added to this intent as extras.
+                // For now, simply sending the action. The service's onStartCommand
+                // will need to handle this action appropriately.
+            }
+            startService(serviceIntent)
+            Log.d(TAG, "Sent ACTION_CAPTURE_AND_TRANSLATE to ScreenTranslatorService via startService.")
+        }
+
+        floatingButtonView?.setOnTouchListener(object : View.OnTouchListener {
+            private var initialX: Int = 0
+            private var initialY: Int = 0
+            private var initialTouchX: Float = 0.toFloat()
+            private var initialTouchY: Float = 0.toFloat()
+
+            override fun onTouch(v: View?, event: MotionEvent?): Boolean {
+                if (floatingButtonParams == null) return false
+                when (event?.action) {
+                    MotionEvent.ACTION_DOWN -> {
+                        initialX = floatingButtonParams!!.x
+                        initialY = floatingButtonParams!!.y
+                        initialTouchX = event.rawX
+                        initialTouchY = event.rawY
+                        return true
+                    }
+                    MotionEvent.ACTION_MOVE -> {
+                        floatingButtonParams!!.x = initialX + (event.rawX - initialTouchX).toInt()
+                        floatingButtonParams!!.y = initialY + (event.rawY - initialTouchY).toInt()
+                        windowManager?.updateViewLayout(floatingButtonView, floatingButtonParams)
+                        return true
+                    }
+                }
+                return false
+            }
+        })
+
+        try {
+            windowManager?.addView(floatingButtonView, floatingButtonParams)
+            Log.d(TAG, "Floating button added to window.")
+        } catch (e: Exception) {
+            Log.e(TAG, "Error adding floating button to window", e)
+        }
+    }
+
+    private fun hideFloatingButton() {
+        if (floatingButtonView != null && windowManager != null) {
+            try {
+                windowManager?.removeView(floatingButtonView)
+                Log.d(TAG, "Floating button removed from window.")
+            } catch (e: Exception) {
+                Log.e(TAG, "Error removing floating button from window", e)
+            } finally {
+                floatingButtonView = null // Ensure it's nulled out even if removeView fails
+            }
         }
     }
 }

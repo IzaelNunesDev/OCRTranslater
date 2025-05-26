@@ -3,6 +3,7 @@ package com.google.ai.edge.gallery.utils
 import android.content.Context
 import android.graphics.PixelFormat
 import android.graphics.Rect
+import android.graphics.RectF // Added for RectF
 import android.os.Build
 import android.view.LayoutInflater
 import android.view.View // Ensure View is imported
@@ -21,6 +22,8 @@ class OverlayManager(private val context: Context) {
     fun addOverlay(stableId: String, originalBounds: Rect, textToDisplay: String) {
         val inflater = LayoutInflater.from(context)
         val overlayView = inflater.inflate(R.layout.translation_balloon, null)
+        // Store the originalBounds (converted to RectF) in the tag for later identification by boundingBox
+        overlayView.tag = RectF(originalBounds)
         val textView = overlayView.findViewById<TextView>(R.id.translated_text_view)
         textView.text = textToDisplay // Use the new parameter
 
@@ -101,15 +104,44 @@ class OverlayManager(private val context: Context) {
         if (viewToUpdate != null) {
             val textView = viewToUpdate.findViewById<TextView>(R.id.translated_text_view)
             textView.text = newText
-            // Optionally update position
+            // Optionally update position if box has changed from the original.
+            // For simplicity, this example assumes the box/ID is the primary key and position doesn't change often.
+            // If position update is needed:
             // val params = viewToUpdate.layoutParams as WindowManager.LayoutParams
-            // params.x = box.left
-            // params.y = box.bottom
-            // windowManager.updateViewLayout(viewToUpdate, params)
+            // if (params.x != box.left || params.y != box.bottom) {
+            //     params.x = box.left
+            //     params.y = box.bottom
+            //     overlayView.tag = RectF(box) // Update the tag if position changes
+            //     windowManager.updateViewLayout(viewToUpdate, params)
+            // }
             Log.d("OverlayManager", "Updated text for overlay ID '$stableId' to '${newText.take(20)}...'")
         } else {
             Log.d("OverlayManager", "updateOverlayText called for ID '$stableId', but no view found. Adding new one.")
-            addOverlay(stableId, box, newText)
+            addOverlay(stableId, box, newText) // This will also set the tag with RectF(box)
+        }
+    }
+
+    /**
+     * Updates the text of an existing overlay identified by its boundingBox.
+     * This method iterates through views and compares their stored RectF tag.
+     * It does not add a new overlay if one is not found.
+     */
+    fun updateOverlay(targetBoundingBox: RectF, newText: String) {
+        var viewFound = false
+        for (view in overlayViews.values) {
+            val storedRectF = view.tag as? RectF
+            if (storedRectF != null && storedRectF == targetBoundingBox) {
+                val textView = view.findViewById<TextView>(R.id.translated_text_view)
+                textView.text = newText
+                // textView.invalidate() // Usually not needed for TextView text change
+                // view.invalidate() // Usually not needed for TextView text change
+                Log.d("OverlayManager", "Updated overlay via RectF ${targetBoundingBox.toShortString()} to text '${newText.take(20)}...'")
+                viewFound = true
+                // break // Assuming one match is enough. If multiple views can have the same RectF, remove break.
+            }
+        }
+        if (!viewFound) {
+            Log.w("OverlayManager", "updateOverlay (by RectF) called for ${targetBoundingBox.toShortString()}, but no matching view found.")
         }
     }
 
